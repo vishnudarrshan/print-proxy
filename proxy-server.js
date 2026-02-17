@@ -1,23 +1,43 @@
-// proxy-server.js
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const http = require('http');
+const WebSocket = require('ws');
 
 const app = express();
-const PORT = process.env.REACT_APP_PROXY_URL || 5001;
+const PORT = process.env.PORT || 5001;
 
-// Environment configurations with proper validation
+// Create HTTP server
+const server = http.createServer(app);
+
+// Create WebSocket server
+const wss = new WebSocket.Server({ 
+  server,
+  path: '/ws', // WebSocket endpoint
+  clientTracking: true
+});
+
+// CORS configuration
+app.use(cors({
+  origin: '*',
+  credentials: true,
+  methods: ['GET', 'POST', 'OPTIONS', 'WEBSOCKET'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Upgrade']
+}));
+
+app.options('*', cors());
+app.use(express.json());
+
+// Environment configurations with fallbacks for REACT_APP_ prefixes
 const ENVIRONMENTS = {
   previewUat: {
     name: 'Preview UAT',
-    baseUrl: process.env.API_URL_PREVIEW_UAT || 'https://preview-uat-print.api.apteancloud.com',
+    baseUrl: process.env.API_URL_PREVIEW_UAT || process.env.REACT_APP_API_URL_PREVIEW_UAT || 'https://preview-uat-print.api.apteancloud.com',
     authType: 'bearer',
-    // ✅ ALL THREE REQUIRED for Preview UAT
-    accountId: process.env.UAT_ACCOUNT_ID,
-    apiKey: process.env.UAT_API_KEY,
-    agentKey: process.env.UAT_AGENT_KEY,
-    // Validation function
+    accountId: process.env.UAT_ACCOUNT_ID || process.env.REACT_APP_UAT_ACCOUNT_ID,
+    apiKey: process.env.UAT_API_KEY || process.env.REACT_APP_UAT_API_KEY,
+    agentKey: process.env.UAT_AGENT_KEY || process.env.REACT_APP_UAT_AGENT_KEY,
     validateCredentials: function() {
       return this.accountId && this.apiKey && this.agentKey;
     },
@@ -31,15 +51,13 @@ const ENVIRONMENTS = {
   },
   production: {
     name: 'Production',
-    baseUrl: process.env.API_URL_PRODUCTION || 'https://print.api.apteancloud.com',
+    baseUrl: process.env.API_URL_PRODUCTION || process.env.REACT_APP_API_URL_PRODUCTION || 'https://print.api.apteancloud.com',
     authType: 'basic',
-    // ✅ ONLY accountId and apiKey required for Production
-    accountId: process.env.PROD_ACCOUNT_ID,
-    apiKey: process.env.PROD_API_KEY,
-    agentKey: process.env.PROD_AGENT_KEY || '', // Optional
-    // Validation function
+    accountId: process.env.PROD_ACCOUNT_ID || process.env.REACT_APP_PROD_ACCOUNT_ID,
+    apiKey: process.env.PROD_API_KEY || process.env.REACT_APP_PROD_API_KEY,
+    agentKey: process.env.PROD_AGENT_KEY || process.env.REACT_APP_PROD_AGENT_KEY || '',
     validateCredentials: function() {
-      return this.accountId && this.apiKey; // Only check accountId and apiKey
+      return this.accountId && this.apiKey;
     },
     getMissingCredentials: function() {
       const missing = [];
@@ -50,18 +68,250 @@ const ENVIRONMENTS = {
   }
 };
 
-// Middleware
-app.use(cors({
-  origin: process.env.ALLOWED_ORIGIN || 'http://localhost:3000',
-  credentials: true
-}));
-app.use(express.json());
+// WebSocket connection handling
+wss.on('connection', (ws, req) => {
+  const clientIp = req.socket.remoteAddress;
+  console.log(`🔌 New WebSocket client connected from ${clientIp}`);
 
-// Debug endpoint to check loaded credentials
+  // Send welcome message
+  ws.send(JSON.stringify({
+    type: 'connection',
+    message: 'Connected to Aptean Proxy WebSocket',
+    timestamp: new Date().toISOString()
+  }));
+
+  // Handle incoming messages
+  ws.on('message', async (message) => {
+    try {
+      const data = JSON.parse(message);
+      console.log('📨 WebSocket message received:', data.type);
+
+      // Handle different message types
+      switch (data.type) {
+        case 'ping':
+          ws.send(JSON.stringify({
+            type: 'pong',
+            timestamp: new Date().toISOString()
+          }));
+          break;
+
+        case 'login':
+          // Handle login via WebSocket
+          const loginResult = await handleAutoLogin(data.environment);
+          ws.send(JSON.stringify({
+            type: 'login-result',
+            ...loginResult,
+            timestamp: new Date().toISOString()
+          }));
+          break;
+
+        case 'subscribe':
+          // Subscribe to updates for a specific environment
+          ws.subscriptions = ws.subscriptions || [];
+          if (data.environment && !ws.subscriptions.includes(data.environment)) {
+            ws.subscriptions.push(data.environment);
+            ws.send(JSON.stringify({
+              type: 'subscribed',
+              environment: data.environment,
+              message: `Subscribed to ${data.environment} updates`,
+              timestamp: new Date().toISOString()
+            }));
+          }
+          break;
+
+        default:
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: 'Unknown message type',
+            timestamp: new Date().toISOString()
+          }));
+      }
+    } catch (error) {
+      console.error('❌ WebSocket message error:', error.message);
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'Invalid message format',
+        error: error.message,
+        timestamp: new Date().toISOString()
+      }));
+    }
+  });
+
+  // Handle client disconnect
+  ws.on('close', () => {
+    console.log('🔌 WebSocket client disconnected');
+  });
+
+  // Handle errors
+  ws.on('error', (error) => {
+    console.error('❌ WebSocket error:', error.message);
+  });
+});
+
+// Broadcast to all connected clients
+function broadcastToAll(message) {
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(message));
+    }
+  });
+}
+
+// Broadcast to specific environment subscribers
+function broadcastToEnvironment(environment, message) {
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN && 
+        client.subscriptions && 
+        client.subscriptions.includes(environment)) {
+      client.send(JSON.stringify(message));
+    }
+  });
+}
+
+// Helper function for auto-login
+async function handleAutoLogin(environment = 'previewUat') {
+  try {
+    const env = ENVIRONMENTS[environment];
+    
+    if (!env) {
+      return { 
+        success: false, 
+        error: 'Invalid environment specified' 
+      };
+    }
+    
+    if (!env.validateCredentials()) {
+      const missing = env.getMissingCredentials();
+      return { 
+        success: false,
+        error: `Missing required credentials for ${env.name}`,
+        missing: missing
+      };
+    }
+    
+    const loginPayload = {
+      accountId: env.accountId,
+      apiKey: env.apiKey
+    };
+    
+    if (env.agentKey) {
+      loginPayload.agentKey = env.agentKey;
+    } else if (env.name === 'Preview UAT') {
+      loginPayload.agentKey = '';
+    }
+    
+    const response = await axios({
+      method: 'POST',
+      url: `${env.baseUrl}/api/v1/print/login`,
+      headers: {
+        'Content-Type': 'application/json',
+        'accept': '*/*'
+      },
+      data: loginPayload,
+      timeout: 15000
+    });
+    
+    if (!response.data.token) {
+      throw new Error('No token received in response');
+    }
+    
+    const fullToken = response.data.token;
+    const jwtToken = fullToken.replace('Bearer ', '').trim();
+    
+    // Broadcast successful login to subscribers
+    broadcastToEnvironment(environment, {
+      type: 'login-success',
+      environment: env.name,
+      timestamp: new Date().toISOString()
+    });
+    
+    return {
+      success: true,
+      environment: env.name,
+      token: fullToken,
+      jwt: jwtToken
+    };
+    
+  } catch (error) {
+    console.error('❌ Auto-login error:', error.message);
+    
+    let errorMessage = error.message;
+    let errorDetails = {};
+    
+    if (error.response) {
+      errorDetails = error.response.data;
+      errorMessage = `API Error ${error.response.status}: ${JSON.stringify(error.response.data)}`;
+    } else if (error.request) {
+      errorMessage = 'No response from API server';
+    }
+    
+    return {
+      success: false,
+      error: errorMessage,
+      details: errorDetails
+    };
+  }
+}
+
+// REST Endpoints
+app.get('/', (req, res) => {
+  res.json({
+    name: 'Aptean Print Proxy Server',
+    version: '2.0.0',
+    server: `https://${req.get('host')}`,
+    features: {
+      rest: true,
+      websocket: true
+    },
+    endpoints: {
+      rest: {
+        health: '/health',
+        debug: '/api/proxy/debug',
+        autoLogin: '/api/proxy/auto-login',
+        testLogin: '/api/proxy/test-login',
+        register: '/api/proxy/register'
+      },
+      websocket: {
+        url: `wss://${req.get('host')}/ws`,
+        protocols: ['ping', 'login', 'subscribe']
+      }
+    },
+    cors: 'Any origin allowed'
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    connections: {
+      websocket: wss.clients.size
+    },
+    environments: {
+      previewUat: {
+        configured: ENVIRONMENTS.previewUat.validateCredentials(),
+        missing: ENVIRONMENTS.previewUat.getMissingCredentials()
+      },
+      production: {
+        configured: ENVIRONMENTS.production.validateCredentials(),
+        missing: ENVIRONMENTS.production.getMissingCredentials()
+      }
+    }
+  });
+});
+
 app.get('/api/proxy/debug', (req, res) => {
-  const debugInfo = {
+  res.json({
+    server: {
+      url: `https://${req.get('host')}`,
+      status: 'running',
+      timestamp: new Date().toISOString(),
+      websocketConnections: wss.clients.size
+    },
     previewUat: {
       name: ENVIRONMENTS.previewUat.name,
+      baseUrl: ENVIRONMENTS.previewUat.baseUrl,
       accountId: ENVIRONMENTS.previewUat.accountId ? '✓ Loaded' : '✗ Missing - REQUIRED',
       apiKey: ENVIRONMENTS.previewUat.apiKey ? '✓ Loaded' : '✗ Missing - REQUIRED',
       agentKey: ENVIRONMENTS.previewUat.agentKey ? '✓ Loaded' : '✗ Missing - REQUIRED',
@@ -70,144 +320,56 @@ app.get('/api/proxy/debug', (req, res) => {
     },
     production: {
       name: ENVIRONMENTS.production.name,
+      baseUrl: ENVIRONMENTS.production.baseUrl,
       accountId: ENVIRONMENTS.production.accountId ? '✓ Loaded' : '✗ Missing - REQUIRED',
       apiKey: ENVIRONMENTS.production.apiKey ? '✓ Loaded' : '✗ Missing - REQUIRED',
       agentKey: ENVIRONMENTS.production.agentKey ? '✓ Loaded (Optional)' : 'Not loaded (Optional)',
       isValid: ENVIRONMENTS.production.validateCredentials(),
       requirements: 'Only accountId and apiKey are REQUIRED'
+    },
+    websocket: {
+      enabled: true,
+      path: '/ws',
+      currentConnections: wss.clients.size,
+      maxConnections: 'Unlimited'
     }
-  };
-  res.json(debugInfo);
+  });
 });
 
-// ✅ AUTO-LOGIN ENDPOINT (Handles both environments correctly)
 app.post('/api/proxy/auto-login', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  
   try {
     const { environment = 'previewUat' } = req.body;
-    const env = ENVIRONMENTS[environment];
+    const result = await handleAutoLogin(environment);
     
-    if (!env) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Invalid environment specified' 
+    if (result.success) {
+      // Broadcast to WebSocket clients
+      broadcastToAll({
+        type: 'rest-login',
+        environment: result.environment,
+        timestamp: new Date().toISOString()
       });
     }
     
-    console.log(`🔐 Auto-login request for ${env.name}`);
-    
-    // Validate credentials based on environment
-    if (!env.validateCredentials()) {
-      const missing = env.getMissingCredentials();
-      return res.status(400).json({ 
-        success: false,
-        error: `Missing required credentials for ${env.name}`,
-        missing: missing,
-        requirements: env.name === 'previewUat' 
-          ? 'Preview UAT requires: accountId, apiKey, AND agentKey'
-          : 'Production requires: accountId AND apiKey (agentKey is optional)'
-      });
-    }
-    
-    // ✅ Prepare EXACT request format for API
-    const loginPayload = {
-      accountId: env.accountId,
-      apiKey: env.apiKey
-    };
-    
-    // ✅ Add agentKey ONLY if it exists (required for UAT, optional for Production)
-    if (env.agentKey) {
-      loginPayload.agentKey = env.agentKey;
-    } else if (env.name === 'Preview UAT') {
-      // For UAT, agentKey is required even if empty string
-      loginPayload.agentKey = '';
-    }
-    
-    console.log('📤 Login Payload for', env.name + ':', JSON.stringify(loginPayload, null, 2));
-    console.log(`📤 Sending to: ${env.baseUrl}/api/v1/print/login`);
-    
-    // Make API request
-    const response = await axios({
-      method: 'POST',
-      url: `${env.baseUrl}/api/v1/print/login`,
-      headers: {
-        'Content-Type': 'application/json',
-        'accept': '*/*',
-        'User-Agent': 'Aptean-Proxy-Server/1.0'
-      },
-      data: loginPayload,
-      timeout: 15000,
-      validateStatus: function (status) {
-        return status < 500; // Resolve only if status code is less than 500
-      }
-    });
-    
-    console.log('📥 Response Status:', response.status);
-    console.log('📥 Response Data:', JSON.stringify(response.data, null, 2));
-    
-    // Check if we got a token
-    if (!response.data.token) {
-      throw new Error('No token received in response');
-    }
-    
-    // Extract token
-    const fullToken = response.data.token;
-    const jwtToken = fullToken.replace('Bearer ', '').trim();
-    
-    console.log(`✅ Auto-login successful for ${env.name}`);
-    console.log(`✅ Token length: ${jwtToken.length} characters`);
-    
-    // Return success response
     res.json({
-      success: true,
-      environment: env.name,
-      token: fullToken,
-      jwt: jwtToken,
-      message: `Token generated successfully for ${env.name}`,
-      timestamp: new Date().toISOString(),
-      requirementsMet: env.name === 'previewUat' 
-        ? 'All three credentials used (accountId, apiKey, agentKey)'
-        : 'AccountId and apiKey used (agentKey is optional)'
+      ...result,
+      proxyServer: `https://${req.get('host')}`,
+      timestamp: new Date().toISOString()
     });
     
   } catch (error) {
-    console.error('❌ Auto-login error:', error.message);
-    
-    let statusCode = 500;
-    let errorMessage = error.message;
-    let errorDetails = {};
-    
-    if (error.response) {
-      // Server responded with error
-      statusCode = error.response.status;
-      errorDetails = error.response.data;
-      console.error('❌ Server Response:', error.response.data);
-      console.error('❌ Server Status:', error.response.status);
-      errorMessage = `API Error ${error.response.status}: ${JSON.stringify(error.response.data)}`;
-    } else if (error.request) {
-      // Request made but no response
-      console.error('❌ No response from server');
-      errorMessage = 'No response from API server. Check network connection and API URL.';
-      errorDetails = { 
-        suggestion: 'Verify the API endpoint is accessible and CORS is configured'
-      };
-    } else {
-      // Request setup error
-      console.error('❌ Request setup failed:', error.message);
-      errorMessage = `Request failed: ${error.message}`;
-    }
-    
-    res.status(statusCode).json({
+    res.status(500).json({
       success: false,
-      error: errorMessage,
-      details: errorDetails,
-      environment: req.body.environment || 'unknown',
+      error: error.message,
       timestamp: new Date().toISOString()
     });
   }
 });
 
-// Test endpoint to verify connectivity
 app.post('/api/proxy/test-login', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  
   try {
     const { environment = 'previewUat' } = req.body;
     const env = ENVIRONMENTS[environment];
@@ -219,7 +381,6 @@ app.post('/api/proxy/test-login', async (req, res) => {
       });
     }
     
-    // Just test connectivity without actually logging in
     const testResponse = await axios({
       method: 'OPTIONS',
       url: `${env.baseUrl}/api/v1/print/login`,
@@ -243,8 +404,9 @@ app.post('/api/proxy/test-login', async (req, res) => {
   }
 });
 
-// Existing register endpoint (unchanged)
 app.post('/api/proxy/register', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  
   try {
     const { token, userData, environment = 'previewUat', credentials } = req.body;
     const env = ENVIRONMENTS[environment];
@@ -253,19 +415,15 @@ app.post('/api/proxy/register', async (req, res) => {
       return res.status(400).json({ error: 'Invalid environment' });
     }
     
-    console.log(`📝 Register request for ${env.name} - ${userData.company}`);
-    
     const headers = {
       'Content-Type': 'application/json',
       'accept': '*/*'
     };
     
     if (environment === 'production' && credentials) {
-      // Production uses Basic Auth
       const basicAuth = Buffer.from(`${credentials.accountId}:${credentials.apiKey}`).toString('base64');
       headers['Authorization'] = `Basic ${basicAuth}`;
     } else if (environment === 'previewUat' && token) {
-      // Preview UAT uses Bearer token
       headers['Authorization'] = `Bearer ${token}`;
     } else {
       return res.status(400).json({ error: 'Missing authentication' });
@@ -278,13 +436,19 @@ app.post('/api/proxy/register', async (req, res) => {
       data: userData
     });
     
+    // Broadcast registration to WebSocket clients
+    broadcastToEnvironment(environment, {
+      type: 'registration',
+      company: userData.company,
+      timestamp: new Date().toISOString()
+    });
+    
     res.json({
       ...response.data,
       environment: env.name
     });
     
   } catch (error) {
-    console.error('❌ Register error:', error.message);
     res.status(error.response?.status || 500).json({
       error: error.message,
       details: error.response?.data
@@ -292,52 +456,54 @@ app.post('/api/proxy/register', async (req, res) => {
   }
 });
 
-// Health check
-app.get('/health', (req, res) => {
-  const health = {
-    status: 'healthy',
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-    environments: {
-      previewUat: {
-        configured: ENVIRONMENTS.previewUat.validateCredentials(),
-        missing: ENVIRONMENTS.previewUat.getMissingCredentials()
+// WebSocket endpoint info
+app.get('/ws-info', (req, res) => {
+  res.json({
+    websocket: {
+      url: `wss://${req.get('host')}/ws`,
+      protocols: ['ping', 'login', 'subscribe'],
+      example: {
+        ping: { type: 'ping' },
+        login: { type: 'login', environment: 'previewUat' },
+        subscribe: { type: 'subscribe', environment: 'production' }
       },
-      production: {
-        configured: ENVIRONMENTS.production.validateCredentials(),
-        missing: ENVIRONMENTS.production.getMissingCredentials()
-      }
+      currentConnections: wss.clients.size
     }
-  };
-  res.json(health);
+  });
 });
 
-app.listen(PORT, () => {
+// Start server
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`
   🚀 Aptean Proxy Server Started!
-  📍 Port: ${PORT}
-  🌐 URL: http://localhost:${PORT}
+  📍 HTTP Port: ${PORT}
+  🔌 WebSocket Port: ${PORT} (same server)
+  🌐 Public URL: https://print-proxy-server.onrender.com
+  
+  📡 WebSocket Endpoint: wss://print-proxy-server.onrender.com/ws
+  
+  🔓 CORS: Any origin allowed
   
   📋 Credential Status:
   
   🔵 Preview UAT:
-     URL: ${ENVIRONMENTS.previewUat.baseUrl}
-     Account ID: ${ENVIRONMENTS.previewUat.accountId ? '✓ Loaded' : '✗ MISSING - REQUIRED'}
-     API Key: ${ENVIRONMENTS.previewUat.apiKey ? '✓ Loaded' : '✗ MISSING - REQUIRED'}
-     Agent Key: ${ENVIRONMENTS.previewUat.agentKey ? '✓ Loaded' : '✗ MISSING - REQUIRED'}
+     Account ID: ${ENVIRONMENTS.previewUat.accountId ? '✓ Loaded' : '✗ MISSING'}
+     API Key: ${ENVIRONMENTS.previewUat.apiKey ? '✓ Loaded' : '✗ MISSING'}
+     Agent Key: ${ENVIRONMENTS.previewUat.agentKey ? '✓ Loaded' : '✗ MISSING'}
      Status: ${ENVIRONMENTS.previewUat.validateCredentials() ? '✅ Ready' : '❌ Not Ready'}
   
   🔴 Production:
-     URL: ${ENVIRONMENTS.production.baseUrl}
-     Account ID: ${ENVIRONMENTS.production.accountId ? '✓ Loaded' : '✗ MISSING - REQUIRED'}
-     API Key: ${ENVIRONMENTS.production.apiKey ? '✓ Loaded' : '✗ MISSING - REQUIRED'}
-     Agent Key: ${ENVIRONMENTS.production.agentKey ? '✓ Loaded (Optional)' : 'Not loaded (Optional)'}
+     Account ID: ${ENVIRONMENTS.production.accountId ? '✓ Loaded' : '✗ MISSING'}
+     API Key: ${ENVIRONMENTS.production.apiKey ? '✓ Loaded' : '✗ MISSING'}
+     Agent Key: ${ENVIRONMENTS.production.agentKey ? '✓ Loaded' : '✗ MISSING'}
      Status: ${ENVIRONMENTS.production.validateCredentials() ? '✅ Ready' : '❌ Not Ready'}
   
   📍 Test Endpoints:
-     GET  http://localhost:${PORT}/health
-     GET  http://localhost:${PORT}/api/proxy/debug
-     POST http://localhost:${PORT}/api/proxy/auto-login
-     POST http://localhost:${PORT}/api/proxy/test-login
+     GET  https://print-proxy-server.onrender.com/
+     GET  https://print-proxy-server.onrender.com/health
+     GET  https://print-proxy-server.onrender.com/api/proxy/debug
+     GET  https://print-proxy-server.onrender.com/ws-info
+     POST https://print-proxy-server.onrender.com/api/proxy/auto-login
+     WS   wss://print-proxy-server.onrender.com/ws
   `);
 });
